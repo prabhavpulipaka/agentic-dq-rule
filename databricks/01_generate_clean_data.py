@@ -1,3 +1,10 @@
+import sys
+sys.path.append("/Workspace/Users/pulipakaprabhav@gmail.com/agentic-dq-rule/src")
+from dq_author.data.generate_clean import generate_clean_dataset
+
+print("Import successful!")
+spark.sql("USE CATALOG workspace")
+spark.sql("USE SCHEMA dq_demo")
 from pyspark.sql import SparkSession
 
 from dq_author.data.generate_clean import (
@@ -9,7 +16,7 @@ from dq_author.data.generate_clean import (
 # Configuration
 # ---------------------------------------------
 
-CATALOG = "main"
+CATALOG = "workspace"
 SCHEMA = "dq_demo"
 SEED = 42
 
