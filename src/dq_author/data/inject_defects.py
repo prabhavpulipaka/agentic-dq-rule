@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Tuple
 
 from pyspark.sql import DataFrame, SparkSession
@@ -24,7 +24,8 @@ def _select_ids(
     """
     Select deterministic IDs from a dataset.
 
-    This function assumes the selected ID column is numeric.
+    The selected IDs are taken from distinct, non-null values
+    and ordered deterministically.
     """
 
     values = (
@@ -41,12 +42,13 @@ def _select_ids(
     if not ids:
         raise ValueError(f"No IDs found in column: {id_column}")
 
-    selected = []
+    if count > len(ids):
+        raise ValueError(
+            f"Requested {count} IDs from {len(ids)} available IDs "
+            f"in column {id_column}"
+        )
 
-    for index in range(count):
-        selected.append(ids[(offset + index) % len(ids)])
-
-    return selected
+    return ids[offset:offset + count]
 
 
 def _add_manifest_entry(
@@ -81,6 +83,14 @@ def inject_defects(
     """
     Create defective copies from clean DataFrames.
 
+    Important design choice:
+    All defect target IDs are selected from the original clean
+    DataFrames before duplicate rows are introduced.
+
+    This keeps the ground-truth manifest deterministic and
+    prevents duplicate order IDs from changing the affected
+    row counts of later defects.
+
     Returns:
         defective_tables
         manifest_rows
@@ -93,22 +103,86 @@ def inject_defects(
 
     manifest: List[Tuple] = []
 
-    injected_at = datetime.utcnow()
+    injected_at = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    # Keep references to the original clean datasets.
+    clean_orders = clean_tables["orders"]
+    clean_order_items = clean_tables["order_items"]
+    clean_customers = clean_tables["customers"]
+
+    # ---------------------------------------------
+    # Select ALL target IDs from the clean baseline
+    # ---------------------------------------------
+    #
+    # Each range is intentionally separated so that
+    # defects do not overlap on the same order.
+    #
+    # seed changes the starting point while preserving
+    # deterministic selection.
+
+    seed_offset = seed % 10
+
+    null_customer_ids = _select_ids(
+        clean_orders,
+        "order_id",
+        count=100,
+        offset=0 + seed_offset,
+    )
+
+    duplicate_order_ids = _select_ids(
+        clean_orders,
+        "order_id",
+        count=100,
+        offset=200 + seed_offset,
+    )
+
+    shipped_before_ids = _select_ids(
+        clean_orders,
+        "order_id",
+        count=100,
+        offset=400 + seed_offset,
+    )
+
+    invalid_status_ids = _select_ids(
+        clean_orders,
+        "order_id",
+        count=100,
+        offset=600 + seed_offset,
+    )
+
+    orphan_ids = _select_ids(
+        clean_orders,
+        "order_id",
+        count=100,
+        offset=800 + seed_offset,
+    )
+
+    future_order_ids = _select_ids(
+        clean_orders,
+        "order_id",
+        count=100,
+        offset=1000 + seed_offset,
+    )
+
+    negative_quantity_ids = _select_ids(
+        clean_order_items,
+        "order_id",
+        count=100,
+        offset=20 + seed_offset,
+    )
+
+    malformed_email_ids = _select_ids(
+        clean_customers,
+        "customer_id",
+        count=100,
+        offset=100 + seed_offset,
+    )
 
     # ---------------------------------------------
     # 1. Null customer_id
     # ---------------------------------------------
 
-    orders = defective["orders"]
-
-    null_customer_ids = _select_ids(
-        orders,
-        "order_id",
-        count=100,
-        offset=seed % 10,
-    )
-
-    orders = orders.withColumn(
+    orders = clean_orders.withColumn(
         "customer_id",
         F.when(
             F.col("order_id").isin(null_customer_ids),
@@ -122,7 +196,7 @@ def inject_defects(
         "orders",
         "customer_id",
         "null_customer_id",
-        len(null_customer_ids),
+        100,
         injection_run_id,
         injected_at,
     )
@@ -131,16 +205,7 @@ def inject_defects(
     # 2. Negative quantity
     # ---------------------------------------------
 
-    order_items = defective["order_items"]
-
-    negative_quantity_ids = _select_ids(
-        order_items,
-        "order_id",
-        count=100,
-        offset=20 + (seed % 10),
-    )
-
-    order_items = order_items.withColumn(
+    order_items = clean_order_items.withColumn(
         "quantity",
         F.when(
             F.col("order_id").isin(negative_quantity_ids),
@@ -154,7 +219,7 @@ def inject_defects(
         "order_items",
         "quantity",
         "negative_quantity",
-        len(negative_quantity_ids),
+        100,
         injection_run_id,
         injected_at,
     )
@@ -162,26 +227,17 @@ def inject_defects(
     # ---------------------------------------------
     # 3. Duplicate order_id
     # ---------------------------------------------
+    #
+    # Duplicate rows are created from the clean baseline.
+    # This happens AFTER the target IDs for all other defects
+    # have already been selected.
+    #
+    # Therefore duplicate rows cannot accidentally expand
+    # the affected row count of later defects.
 
-    duplicate_order_ids = _select_ids(
-        orders,
-        "order_id",
-        count=100,
-        offset=200,
+    duplicate_rows = clean_orders.filter(
+        F.col("order_id").isin(duplicate_order_ids)
     )
-
-    duplicate_rows = (
-        orders
-        .filter(F.col("order_id").isin(duplicate_order_ids))
-        .withColumn(
-            "customer_id",
-            F.col("customer_id"),
-        )
-    )
-
-    # Duplicate rows preserve the same order_id.
-    # The resulting table has an additional copy of
-    # each selected order.
 
     orders = orders.unionByName(duplicate_rows)
 
@@ -191,7 +247,7 @@ def inject_defects(
         "orders",
         "order_id",
         "duplicate_order_id",
-        len(duplicate_order_ids),
+        100,
         injection_run_id,
         injected_at,
     )
@@ -199,13 +255,6 @@ def inject_defects(
     # ---------------------------------------------
     # 4. Shipped date before order date
     # ---------------------------------------------
-
-    shipped_before_ids = _select_ids(
-        orders,
-        "order_id",
-        count=100,
-        offset=400,
-    )
 
     orders = orders.withColumn(
         "shipped_date",
@@ -221,7 +270,7 @@ def inject_defects(
         "orders",
         "shipped_date,order_date",
         "shipped_before_order",
-        len(shipped_before_ids),
+        100,
         injection_run_id,
         injected_at,
     )
@@ -229,13 +278,6 @@ def inject_defects(
     # ---------------------------------------------
     # 5. Invalid status
     # ---------------------------------------------
-
-    invalid_status_ids = _select_ids(
-        orders,
-        "order_id",
-        count=100,
-        offset=600,
-    )
 
     orders = orders.withColumn(
         "status",
@@ -251,7 +293,7 @@ def inject_defects(
         "orders",
         "status",
         "invalid_status",
-        len(invalid_status_ids),
+        100,
         injection_run_id,
         injected_at,
     )
@@ -259,13 +301,6 @@ def inject_defects(
     # ---------------------------------------------
     # 6. Orphan customer_id
     # ---------------------------------------------
-
-    orphan_ids = _select_ids(
-        orders,
-        "order_id",
-        count=100,
-        offset=800,
-    )
 
     orders = orders.withColumn(
         "customer_id",
@@ -281,7 +316,7 @@ def inject_defects(
         "orders",
         "customer_id",
         "orphan_customer_id",
-        len(orphan_ids),
+        100,
         injection_run_id,
         injected_at,
     )
@@ -290,16 +325,7 @@ def inject_defects(
     # 7. Malformed email
     # ---------------------------------------------
 
-    customers = defective["customers"]
-
-    malformed_email_ids = _select_ids(
-        customers,
-        "customer_id",
-        count=100,
-        offset=100,
-    )
-
-    customers = customers.withColumn(
+    customers = clean_customers.withColumn(
         "email",
         F.when(
             F.col("customer_id").isin(malformed_email_ids),
@@ -313,7 +339,7 @@ def inject_defects(
         "customers",
         "email",
         "malformed_email",
-        len(malformed_email_ids),
+        100,
         injection_run_id,
         injected_at,
     )
@@ -321,13 +347,6 @@ def inject_defects(
     # ---------------------------------------------
     # 8. Future order date
     # ---------------------------------------------
-
-    future_order_ids = _select_ids(
-        orders,
-        "order_id",
-        count=100,
-        offset=1000,
-    )
 
     orders = orders.withColumn(
         "order_date",
@@ -343,14 +362,20 @@ def inject_defects(
         "orders",
         "order_date",
         "future_order_date",
-        len(future_order_ids),
+        100,
         injection_run_id,
         injected_at,
     )
 
+    # ---------------------------------------------
+    # Final defective datasets
+    # ---------------------------------------------
+
     defective["orders"] = orders
     defective["order_items"] = order_items
     defective["customers"] = customers
+
+    # Payments intentionally remain unchanged for this phase.
 
     return defective, manifest
 
@@ -385,10 +410,12 @@ def write_manifest(
         schema=manifest_schema(),
     )
 
-    manifest_df.write \
-        .format("delta") \
-        .mode(mode) \
-        .option("mergeSchema", "true") \
+    (
+        manifest_df.write
+        .format("delta")
+        .mode(mode)
+        .option("mergeSchema", "true")
         .saveAsTable(
             f"{catalog}.{schema}.injected_defects"
         )
+    )
