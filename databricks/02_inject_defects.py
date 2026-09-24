@@ -1,4 +1,3 @@
-from pyspark.sql import SparkSession
 
 from dq_author.data.inject_defects import (
     inject_defects,
@@ -9,7 +8,7 @@ from dq_author.data.inject_defects import (
 # Configuration
 # ---------------------------------------------
 
-CATALOG = "main"
+CATALOG = "workspace"
 SCHEMA = "dq_demo"
 
 INJECTION_RUN_ID = "run_001"

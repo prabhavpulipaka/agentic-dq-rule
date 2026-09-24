@@ -1,6 +1,8 @@
-from datetime import datetime
-
+import sys
 from pyspark.sql import SparkSession
+spark = SparkSession.builder.getOrCreate()
+sys.path.append("/Workspace/Users/pulipakaprabhav@gmail.com/agentic-dq-rule/src")
+from datetime import datetime, timezone
 from pyspark.sql import functions as F
 from pyspark.sql.types import (
     NumericType,
@@ -12,16 +14,16 @@ from pyspark.sql.types import (
 # Configuration
 # ---------------------------------------------
 
-CATALOG = "main"
+CATALOG = "workspace"
 SCHEMA = "dq_demo"
 
 PROFILE_TABLE = f"{CATALOG}.{SCHEMA}.dq_profiles"
 
 TABLES_TO_PROFILE = [
-    "customers",
-    "orders",
-    "order_items",
-    "payments",
+    "customers_defective",
+    "orders_defective",
+    "order_items_defective",
+    "payments_defective",
 ]
 
 spark = SparkSession.builder.getOrCreate()
@@ -100,12 +102,16 @@ def profile_table(
         )
 
         value_distribution = [
-            {
-                "value": str(row[column_name]),
-                "count": row["count"],
-            }
-            for row in top_values
-        ]
+    {
+        "value": (
+            "<NULL>"
+            if row[column_name] is None
+            else str(row[column_name])
+        ),
+        "count": row["count"],
+    }
+    for row in top_values
+    ]
 
         profile_rows.append(
             {
@@ -119,7 +125,7 @@ def profile_table(
                 "min_value": min_value,
                 "max_value": max_value,
                 "value_distribution": value_distribution,
-                "profiled_at": datetime.utcnow(),
+                "profiled_at": datetime.now(timezone.utc).replace(tzinfo=None),
             }
         )
 
